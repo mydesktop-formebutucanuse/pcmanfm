@@ -38,6 +38,12 @@
 
 #include <cairo-xlib.h>
 
+#if GTK_CHECK_VERSION(3, 10, 0) && CAIRO_VERSION >= CAIRO_VERSION_ENCODE(1, 14, 0)
+# define HIDPI_WALLPAPER 1
+#else
+# define HIDPI_WALLPAPER 0
+#endif
+
 #include "pref.h"
 #include "main-win.h"
 
@@ -1818,6 +1824,34 @@ static void queue_layout_items(FmDesktop* desktop)
         desktop->idle_layout = gdk_threads_add_idle((GSourceFunc)on_idle_layout, desktop);
 }
 
+#if GTK_CHECK_VERSION(3, 10, 0)
+/* The folder model gives icons sized in application pixels, so on a scaled
+   (HiDPI) screen they would be stretched and blurry.  Load the same icon in
+   device pixels instead, unless the model shows a thumbnail for the file. */
+static GdkPixbuf *get_device_icon(FmDesktopItem *item, GdkPixbuf *icon, int scale)
+{
+    FmIcon *fi_icon = fm_file_info_get_icon(item->fi);
+    const char *fallback = NULL;
+    GdkPixbuf *pix;
+
+    if (icon == NULL || fi_icon == NULL)
+        return NULL;
+    /* same fallbacks as FmFolderModel uses */
+    if (fm_file_info_is_dir(item->fi))
+        fallback = "folder";
+    else if (fm_file_info_is_desktop_entry(item->fi))
+        fallback = "application-x-executable";
+    /* pixbufs are cached per icon and size, so this is the model's one
+       unless it was replaced with a thumbnail */
+    pix = fm_pixbuf_from_icon_with_fallback(fi_icon, fm_config->big_icon_size, fallback);
+    if (pix)
+        g_object_unref(pix);
+    if (pix != icon)
+        return NULL;
+    return fm_pixbuf_from_icon_with_fallback(fi_icon, fm_config->big_icon_size * scale, fallback);
+}
+#endif
+
 static void paint_item(FmDesktop* self, FmDesktopItem* item, cairo_t* cr, GdkRectangle* expose_area, GdkPixbuf* icon)
 {
 #if GTK_CHECK_VERSION(3, 0, 0)
@@ -1831,6 +1865,10 @@ static void paint_item(FmDesktop* self, FmDesktopItem* item, cairo_t* cr, GdkRec
     GdkRGBA rgba;
 #else
     GdkWindow* window;
+#endif
+#if GTK_CHECK_VERSION(3, 10, 0)
+    GdkPixbuf *device_icon;
+    int scale;
 #endif
     int text_x, text_y;
 
@@ -1906,6 +1944,26 @@ static void paint_item(FmDesktop* self, FmDesktopItem* item, cairo_t* cr, GdkRec
         g_object_set(G_OBJECT(self), "tooltip-text", NULL, NULL);
 
     /* draw the icon */
+#if GTK_CHECK_VERSION(3, 10, 0)
+    scale = gtk_widget_get_scale_factor(widget);
+    if (scale > 1 && (device_icon = get_device_icon(item, icon, scale)) != NULL)
+    {
+        GdkRectangle rect;
+
+        /* render it in device pixels */
+        rect.x = item->icon_rect.x * scale;
+        rect.y = item->icon_rect.y * scale;
+        rect.width = item->icon_rect.width * scale;
+        rect.height = item->icon_rect.height * scale;
+        cairo_save(cr);
+        cairo_scale(cr, 1.0 / scale, 1.0 / scale);
+        g_object_set(self->icon_render, "pixbuf", device_icon, "info", item->fi, NULL);
+        gtk_cell_renderer_render(GTK_CELL_RENDERER(self->icon_render), cr, widget, &rect, &rect, state);
+        cairo_restore(cr);
+        g_object_unref(device_icon);
+        return;
+    }
+#endif
     g_object_set(self->icon_render, "pixbuf", icon, "info", item->fi, NULL);
 #if GTK_CHECK_VERSION(3, 0, 0)
     gtk_cell_renderer_render(GTK_CELL_RENDERER(self->icon_render), cr, widget, &item->icon_rect, &item->icon_rect, state);
@@ -2122,6 +2180,7 @@ static void update_background(FmDesktop* desktop, int is_it)
 #if GTK_CHECK_VERSION(3, 0, 0)
     cairo_pattern_t *pattern;
 #endif
+    gint scale = 1;
 
     Display* xdisplay;
     Pixmap xpixmap;
@@ -2269,6 +2328,13 @@ static void update_background(FmDesktop* desktop, int is_it)
         return;
     }
 
+#if HIDPI_WALLPAPER
+    /* Draw the wallpaper in device pixels on a scaled (HiDPI) screen, so it
+       is not stretched, and so GDK can make it the X background of the window
+       (it does that only if the scale matches); without it every exposed area
+       stays empty until we repaint it. */
+    scale = gdk_window_get_scale_factor(window);
+#endif
     if(!cache->bg) /* no cached image found */
     {
         int src_w, src_h;
@@ -2287,15 +2353,15 @@ static void update_background(FmDesktop* desktop, int is_it)
             gdk_screen_get_monitor_geometry(screen, desktop->monitor, &geom);
             if (desktop->conf.wallpaper_mode == FM_WP_SCREEN)
             {
-                dest_w = gdk_screen_get_width(screen);
-                dest_h = gdk_screen_get_height(screen);
-                x = -geom.x;
-                y = -geom.y;
+                dest_w = gdk_screen_get_width(screen) * scale;
+                dest_h = gdk_screen_get_height(screen) * scale;
+                x = -geom.x * scale;
+                y = -geom.y * scale;
             }
             else
             {
-                dest_w = geom.width;
-                dest_h = geom.height;
+                dest_w = geom.width * scale;
+                dest_h = geom.height * scale;
             }
         }
 #if GTK_CHECK_VERSION(3, 0, 0)
@@ -2361,6 +2427,9 @@ static void update_background(FmDesktop* desktop, int is_it)
         gdk_cairo_set_source_pixbuf(cr, pix, x, y);
         cairo_paint(cr);
         cairo_destroy(cr);
+#if HIDPI_WALLPAPER
+        cairo_surface_set_device_scale(cache->bg, scale, scale);
+#endif
         cache->wallpaper_mode = desktop->conf.wallpaper_mode;
     }
 #if GTK_CHECK_VERSION(3, 0, 0)
@@ -2474,12 +2543,128 @@ static void on_row_deleting(FmFolderModel* model, GtkTreePath* tp,
     desktop_item_free(data);
 }
 
+/* Files dropped on the desktop from another window show up only later,
+   when the folder monitor reports them.  Remember where each one was
+   dropped and put it there when its row is inserted. */
+typedef struct
+{
+    char *name;
+    int x, y;
+} FmDesktopDrop;
+
+static void clear_pending_drops(FmDesktop *desktop)
+{
+    GList *l;
+
+    for (l = desktop->pending_drops; l; l = l->next)
+    {
+        FmDesktopDrop *drop = l->data;
+        g_free(drop->name);
+        g_slice_free(FmDesktopDrop, drop);
+    }
+    g_list_free(desktop->pending_drops);
+    desktop->pending_drops = NULL;
+    if (desktop->pending_drops_timeout)
+    {
+        g_source_remove(desktop->pending_drops_timeout);
+        desktop->pending_drops_timeout = 0;
+    }
+}
+
+static gboolean on_pending_drops_timeout(gpointer user_data)
+{
+    FmDesktop *desktop = user_data;
+
+    desktop->pending_drops_timeout = 0;
+    clear_pending_drops(desktop);
+    return FALSE;
+}
+
+static gboolean on_dnd_dest_files_dropped(FmDndDest *dd, int x, int y,
+                                          guint action, guint info_type,
+                                          FmPathList *files, FmDesktop *desktop)
+{
+    FmPath *dest = fm_dnd_dest_get_dest_path(dd);
+    FmFolder *folder;
+    GList *l;
+    int dx = 0, dy = 0;
+
+    if (desktop->model == NULL || dest == NULL || files == NULL)
+        return FALSE;
+    folder = fm_folder_model_get_folder(desktop->model);
+    /* dropped on a folder icon, not on the desktop itself */
+    if (folder == NULL || !fm_path_equal(dest, fm_folder_get_path(folder)))
+        return FALSE;
+
+    clear_pending_drops(desktop);
+    /* center the first icon under the pointer, the rest go below it */
+    x -= desktop->cell_w / 2;
+    y -= desktop->ypad + fm_config->big_icon_size / 2;
+    for (l = fm_path_list_peek_head_link(files); l; l = l->next)
+    {
+        FmPath *path = l->data;
+        FmDesktopDrop *drop;
+
+        /* already in this folder, nothing new will appear */
+        if (fm_path_equal(fm_path_get_parent(path), dest))
+            continue;
+        drop = g_slice_new(FmDesktopDrop);
+        drop->name = g_strdup(fm_path_get_basename(path));
+        drop->x = x + dx;
+        drop->y = y + dy;
+        desktop->pending_drops = g_list_append(desktop->pending_drops, drop);
+        dy += desktop->cell_h;
+        if (y + dy + (int)desktop->cell_h > desktop->working_area.y + desktop->working_area.height)
+        {
+            dy = 0;
+            dx += desktop->cell_w;
+        }
+    }
+    if (desktop->pending_drops)
+        desktop->pending_drops_timeout = gdk_threads_add_timeout_seconds(60,
+                                                on_pending_drops_timeout, desktop);
+    /* let FmDndDest copy or move the files */
+    return FALSE;
+}
+
+static void place_dropped_item(FmDesktop *desktop, FmDesktopItem *item, GtkTreeIter *it)
+{
+    const char *name = fm_file_info_get_name(item->fi);
+    GList *l;
+
+    for (l = desktop->pending_drops; l; l = l->next)
+    {
+        FmDesktopDrop *drop = l->data;
+        GdkPixbuf *icon = NULL;
+
+        if (strcmp(drop->name, name) != 0)
+            continue;
+        gtk_tree_model_get(GTK_TREE_MODEL(desktop->model), it,
+                           FM_FOLDER_MODEL_COL_ICON, &icon, -1);
+        item->area.x = drop->x;
+        item->area.y = drop->y;
+        calc_item_size(desktop, item, icon);
+        if (icon)
+            g_object_unref(icon);
+        move_item(desktop, item, drop->x, drop->y, FALSE);
+        queue_config_save(desktop);
+        desktop->pending_drops = g_list_delete_link(desktop->pending_drops, l);
+        g_free(drop->name);
+        g_slice_free(FmDesktopDrop, drop);
+        if (desktop->pending_drops == NULL)
+            clear_pending_drops(desktop);
+        break;
+    }
+}
+
 static void on_row_inserted(FmFolderModel* mod, GtkTreePath* tp, GtkTreeIter* it, FmDesktop* desktop)
 {
     FmDesktopItem* item = desktop_item_new(mod, it);
     gint *indices = gtk_tree_path_get_indices(tp);
     fm_desktop_accessible_item_added(desktop, item, indices[0]);
     fm_folder_model_set_item_userdata(mod, it, item);
+    if (desktop->pending_drops)
+        place_dropped_item(desktop, item, it);
     queue_layout_items(desktop);
 }
 
@@ -3103,6 +3288,13 @@ static void forward_event_to_rootwin(GdkScreen *gscreen, GdkEvent *event)
 {
     XButtonEvent xev, xev2;
     Display *dpy = GDK_DISPLAY_XDISPLAY(gdk_screen_get_display(gscreen));
+    gint scale = 1;
+
+#if GTK_CHECK_VERSION(3, 10, 0)
+    /* GDK gives coordinates in scaled pixels (GDK_SCALE or the XSETTINGS
+       Gdk/WindowScalingFactor), but the window manager reads X pixels. */
+    scale = gdk_window_get_scale_factor(gdk_screen_get_root_window(gscreen));
+#endif
 
     if (event->type == GDK_BUTTON_PRESS || event->type == GDK_BUTTON_RELEASE)
     {
@@ -3143,6 +3335,10 @@ static void forward_event_to_rootwin(GdkScreen *gscreen, GdkEvent *event)
     }
     else
         return ;
+    xev.x *= scale;
+    xev.y *= scale;
+    xev.x_root *= scale;
+    xev.y_root *= scale;
     xev.window = GDK_WINDOW_XID(gdk_screen_get_root_window(gscreen));
     xev.root = xev.window;
     xev.subwindow = None;
@@ -3341,6 +3537,53 @@ static void _stop_rubberbanding(FmDesktop *self, gint x, gint y)
     gtk_grab_remove(GTK_WIDGET(self));
 }
 
+/* When we forward a button press to the window manager it may grab the
+   pointer for its menu and get the release itself, so we never see it.
+   Forget such a button once it is not held down anymore, otherwise every
+   other button would be ignored until a drag. */
+static void forget_released_button(FmDesktop *self, GdkEvent *event)
+{
+    GdkModifierType state = 0;
+    guint button = self->button_pressed;
+    gboolean forwarded = self->forward_pending;
+#if GTK_CHECK_VERSION(3, 14, 0)
+    GdkEvent *release;
+    gdouble x = 0, y = 0, x_root = 0, y_root = 0;
+#endif
+
+    if (button == 0 || button > 5 || self->rubber_bending || self->dragging)
+        return;
+    gdk_event_get_state(event, &state);
+    if (state & (GDK_BUTTON1_MASK << (button - 1)))
+        return;
+    self->button_pressed = 0;
+    self->forward_pending = FALSE;
+#if GTK_CHECK_VERSION(3, 14, 0)
+    if (!forwarded)
+        return;
+    /* GTK missed the release too, and its drag gesture would hold on to
+       the press and ignore the next drag of an icon, so give it one */
+    gdk_event_get_coords(event, &x, &y);
+    gdk_event_get_root_coords(event, &x_root, &y_root);
+    release = gdk_event_new(GDK_BUTTON_RELEASE);
+    release->button.window = g_object_ref(gtk_widget_get_window(GTK_WIDGET(self)));
+    release->button.send_event = TRUE;
+    release->button.time = gdk_event_get_time(event);
+    release->button.x = x;
+    release->button.y = y;
+    release->button.x_root = x_root;
+    release->button.y_root = y_root;
+    release->button.state = state | (GDK_BUTTON1_MASK << (button - 1));
+    release->button.button = button;
+    gdk_event_set_device(release, gdk_event_get_device(event));
+    gdk_event_set_source_device(release, gdk_event_get_source_device(event));
+    gtk_widget_event(GTK_WIDGET(self), release);
+    gdk_event_free(release);
+#else
+    (void)forwarded;
+#endif
+}
+
 static gboolean on_button_press(GtkWidget* w, GdkEventButton* evt)
 {
     FmDesktop* self = (FmDesktop*)w;
@@ -3359,6 +3602,7 @@ static gboolean on_button_press(GtkWidget* w, GdkEventButton* evt)
 
     if(evt->type == GDK_BUTTON_PRESS)
     {
+        forget_released_button(self, (GdkEvent*)evt);
         /* ignore another buttons while some is in progress */
         if (self->button_pressed == 0)
             self->button_pressed = evt->button;
@@ -3565,6 +3809,7 @@ static gboolean on_single_click_timeout(gpointer user_data)
 static gboolean on_motion_notify(GtkWidget* w, GdkEventMotion* evt)
 {
     FmDesktop* self = (FmDesktop*)w;
+    forget_released_button(self, (GdkEvent*)evt);
     if(! self->button_pressed)
     {
         if(fm_config->single_click)
@@ -4285,11 +4530,19 @@ static void on_realize(GtkWidget* w)
     FmDesktop* self = (FmDesktop*)w;
     PangoFontDescription *font_desc;
     PangoContext* pc;
+    GdkWindow *window;
+    XSetWindowAttributes attr;
 #if GTK_CHECK_VERSION(3, 0, 0)
     char *css_data;
 #endif
 
     GTK_WIDGET_CLASS(fm_desktop_parent_class)->realize(w);
+    /* Let the X server keep what we drew, so it puts the icons back itself
+       when a window moves away, instead of asking us to draw them again. */
+    window = gtk_widget_get_window(w);
+    attr.backing_store = WhenMapped;
+    XChangeWindowAttributes(GDK_WINDOW_XDISPLAY(window), GDK_WINDOW_XID(window),
+                            CWBackingStore, &attr);
     gtk_window_set_skip_pager_hint(GTK_WINDOW(w), TRUE);
     gtk_window_set_skip_taskbar_hint(GTK_WINDOW(w), TRUE);
     gtk_window_set_resizable((GtkWindow*)w, FALSE);
@@ -4638,6 +4891,20 @@ static void on_drag_begin (GtkWidget *widget, GdkDragContext *drag_context)
     queue_layout_items(desktop);
 }
 
+static void on_drag_end (GtkWidget *widget, GdkDragContext *drag_context)
+{
+    /* The button release that ends a drag goes to the DnD grab, so
+       on_button_release() never sees it.  Clear the drag state here,
+       otherwise the dragged items stay hidden and the next click is
+       not forwarded to the window manager until another release. */
+    FmDesktop *desktop = FM_DESKTOP(widget);
+
+    desktop->dragging = FALSE;
+    desktop->button_pressed = 0;
+    desktop->forward_pending = FALSE;
+    queue_layout_items(desktop);
+}
+
 static void on_dnd_src_data_get(FmDndSrc* ds, FmDesktop* desktop)
 {
     FmFileInfoList* files = _dup_selected_files(FM_FOLDER_VIEW(desktop));
@@ -4862,7 +5129,9 @@ static void fm_desktop_destroy(GtkObject *object)
 
         g_signal_handlers_disconnect_by_func(self->dnd_src, on_dnd_src_data_get, self);
         g_object_unref(self->dnd_src);
+        g_signal_handlers_disconnect_by_func(self->dnd_dest, on_dnd_dest_files_dropped, self);
         g_object_unref(self->dnd_dest);
+        clear_pending_drops(self);
     }
 
     if (self->conf.configured)
@@ -4998,6 +5267,8 @@ static GObject* fm_desktop_constructor(GType type, guint n_construct_properties,
 
     self->dnd_dest = fm_dnd_dest_new_with_handlers((GtkWidget*)self);
     fm_dnd_dest_add_targets((GtkWidget*)self, dnd_targets, G_N_ELEMENTS(dnd_targets));
+    g_signal_connect(self->dnd_dest, "files-dropped",
+                     G_CALLBACK(on_dnd_dest_files_dropped), self);
 
     gtk_window_group_add_window(win_group, GTK_WINDOW(self));
 
@@ -5079,6 +5350,7 @@ static void fm_desktop_class_init(FmDesktopClass *klass)
 #if FM_CHECK_VERSION(1, 2, 1)
     widget_class->drag_begin = on_drag_begin;
 #endif
+    widget_class->drag_end = on_drag_end;
     /* widget_class->drag_data_get = on_drag_data_get; */
 
     if(XInternAtoms(gdk_x11_get_default_xdisplay(), atom_names,
