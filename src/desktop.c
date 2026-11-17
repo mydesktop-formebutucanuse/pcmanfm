@@ -2198,6 +2198,55 @@ static gboolean _bg_cache_is_current(FmDesktop *self)
     return self->cache != NULL;
 }
 
+#if GTK_CHECK_VERSION(3, 0, 0)
+/* Copies @image, an RGB24 image surface, to the X pixmap of @bg, a surface of
+   the same size. Drawing the wallpaper on @bg itself would let cairo send it
+   through a MIT-SHM segment, which cairo then keeps for later: as big as the
+   wallpaper (24 MB for a 3024x1964 one), shared with the X server, for as long
+   as the desktop runs. XPutImage() leaves nothing behind. */
+static void _upload_wallpaper(cairo_surface_t *bg, cairo_surface_t *image)
+{
+    Display *dpy = cairo_xlib_surface_get_display(bg);
+    Drawable drawable = cairo_xlib_surface_get_drawable(bg);
+    Visual *visual = cairo_xlib_surface_get_visual(bg);
+    int width = cairo_image_surface_get_width(image);
+    int height = cairo_image_surface_get_height(image);
+    XImage *ximage = NULL;
+
+    cairo_surface_flush(image);
+    /* an RGB24 pixel is a 32-bit 0x00RRGGBB in native byte order */
+    if(cairo_xlib_surface_get_depth(bg) == 24 && visual->red_mask == 0xff0000
+       && visual->green_mask == 0xff00 && visual->blue_mask == 0xff)
+        ximage = XCreateImage(dpy, visual, 24, ZPixmap, 0,
+                              (char*)cairo_image_surface_get_data(image), width, height,
+                              32, cairo_image_surface_get_stride(image));
+    if(ximage && ximage->bits_per_pixel == 32)
+    {
+        GC gc = XCreateGC(dpy, drawable, 0, NULL);
+
+        /* Xlib swaps the bytes if the server wants another order */
+        ximage->byte_order = (G_BYTE_ORDER == G_LITTLE_ENDIAN) ? LSBFirst : MSBFirst;
+        XPutImage(dpy, drawable, gc, ximage, 0, 0, 0, 0, width, height);
+        XFreeGC(dpy, gc);
+        cairo_surface_mark_dirty(bg);
+    }
+    else /* another visual: let cairo convert the pixels */
+    {
+        cairo_t *cr = cairo_create(bg);
+
+        cairo_set_source_surface(cr, image, 0, 0);
+        cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+        cairo_paint(cr);
+        cairo_destroy(cr);
+    }
+    if(ximage)
+    {
+        ximage->data = NULL; /* it is the image surface's */
+        XDestroyImage(ximage);
+    }
+}
+#endif
+
 static void update_background(FmDesktop* desktop, int is_it)
 {
     GtkWidget* widget = (GtkWidget*)desktop;
@@ -2371,6 +2420,9 @@ static void update_background(FmDesktop* desktop, int is_it)
         int dest_w, dest_h;
         int x = 0, y = 0;
         GdkRectangle geom;
+#if GTK_CHECK_VERSION(3, 0, 0)
+        cairo_surface_t *image;
+#endif
 
         gdk_screen_get_monitor_geometry(screen, desktop->monitor, &geom);
         cache->geom = geom;
@@ -2407,7 +2459,9 @@ static void update_background(FmDesktop* desktop, int is_it)
         cache->bg = cairo_xlib_surface_create(xdisplay, xpixmap,
                                               GDK_VISUAL_XVISUAL(gdk_screen_get_system_visual(screen)),
                                               dest_w, dest_h);
-        cr = cairo_create(cache->bg);
+        /* drawn in our memory first, see _upload_wallpaper() */
+        image = cairo_image_surface_create(CAIRO_FORMAT_RGB24, dest_w, dest_h);
+        cr = cairo_create(image);
 #else
         cache->bg = gdk_pixmap_new(window, dest_w, dest_h, -1);
         cr = gdk_cairo_create(cache->bg);
@@ -2462,6 +2516,10 @@ static void update_background(FmDesktop* desktop, int is_it)
         gdk_cairo_set_source_pixbuf(cr, pix, x, y);
         cairo_paint(cr);
         cairo_destroy(cr);
+#if GTK_CHECK_VERSION(3, 0, 0)
+        _upload_wallpaper(cache->bg, image);
+        cairo_surface_destroy(image);
+#endif
 #if HIDPI_WALLPAPER
         cairo_surface_set_device_scale(cache->bg, scale, scale);
 #endif
