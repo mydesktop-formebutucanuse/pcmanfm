@@ -363,6 +363,16 @@ static inline void load_items(FmDesktop* desktop)
     queue_layout_items(desktop);
 }
 
+/* Makes @item the one under the pointer, and its name the tooltip. Callers do
+   it only when the item changes: each time the tooltip is set, GTK asks the X
+   server where the pointer is, four round trips. */
+static void set_hover_item(FmDesktop* desktop, FmDesktopItem* item)
+{
+    desktop->hover_item = item;
+    g_object_set(G_OBJECT(desktop), "tooltip-text",
+                 item ? fm_file_info_get_disp_name(item->fi) : NULL, NULL);
+}
+
 static inline void unload_items(FmDesktop* desktop)
 {
     /* remove existing fixed items */
@@ -370,8 +380,7 @@ static inline void unload_items(FmDesktop* desktop)
     desktop->fixed_items = NULL;
     desktop->focus = NULL;
     desktop->drop_hilight = NULL;
-    desktop->hover_item = NULL;
-    g_object_set(G_OBJECT(desktop), "tooltip-text", NULL, NULL);
+    set_hover_item(desktop, NULL);
 }
 
 static inline void reload_items(FmDesktop *desktop)
@@ -1945,11 +1954,6 @@ static void paint_item(FmDesktop* self, FmDesktopItem* item, cairo_t* cr, GdkRec
 #endif
                         item->text_rect.x, item->text_rect.y, item->text_rect.width, item->text_rect.height);
 
-    if(item == self->hover_item) /* hovered */
-        g_object_set(G_OBJECT(self), "tooltip-text", fm_file_info_get_disp_name(item->fi), NULL);
-    else
-        g_object_set(G_OBJECT(self), "tooltip-text", NULL, NULL);
-
     /* draw the icon */
 #if GTK_CHECK_VERSION(3, 10, 0)
     scale = gtk_widget_get_scale_factor(widget);
@@ -2636,11 +2640,8 @@ static void on_row_deleting(FmFolderModel* model, GtkTreePath* tp,
     if((gpointer)desktop->drop_hilight == data)
         desktop->drop_hilight = NULL;
     if((gpointer)desktop->hover_item == data)
-    {
-        desktop->hover_item = NULL;
         /* bug #3615015: after deleting the item tooltip stuck on the desktop */
-        g_object_set(G_OBJECT(desktop), "tooltip-text", NULL, NULL);
-    }
+        set_hover_item(desktop, NULL);
     fm_desktop_accessible_item_deleted(desktop, data);
     desktop_item_free(data);
 }
@@ -2785,6 +2786,8 @@ static void on_row_changed(FmFolderModel* model, GtkTreePath* tp, GtkTreeIter* i
                        FM_FOLDER_MODEL_COL_INFO, &item->fi,
                        FM_FOLDER_MODEL_COL_ICON, &icon, -1);
     fm_file_info_ref(item->fi);
+    if(item == desktop->hover_item) /* it may have a new name */
+        set_hover_item(desktop, item);
 
     /* we need to redraw old area as we changing data */
     redraw_item(desktop, item);
@@ -3816,7 +3819,7 @@ static gboolean on_button_press(GtkWidget* w, GdkEventButton* evt)
         if(tp)
             gtk_tree_path_free(tp);
         /* SF bug #929: after click the tooltip is still set to the item name */
-        self->hover_item = NULL;
+        set_hover_item(self, NULL);
     }
     /* forward the event to root window */
     else if(evt->button != 1 && evt->button == self->button_pressed)
@@ -3935,7 +3938,7 @@ static gboolean on_motion_notify(GtkWidget* w, GdkEventMotion* evt)
                     self->single_click_timeout_handler = 0;
                 }
                 window = gtk_widget_get_window(w);
-                self->hover_item = item;
+                set_hover_item(self, item);
                 if (hover_item)
                     redraw_item(self, hover_item);
                 if(item)
@@ -3966,7 +3969,7 @@ static gboolean on_motion_notify(GtkWidget* w, GdkEventMotion* evt)
 
             if(item != hover_item)
             {
-                self->hover_item = item;
+                set_hover_item(self, item);
                 if (hover_item)
                     redraw_item(self, hover_item);
                 if(item)
