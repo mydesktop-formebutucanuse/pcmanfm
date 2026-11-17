@@ -3595,7 +3595,10 @@ static void on_size_allocate(GtkWidget* w, GtkAllocation* alloc)
         if(!_bg_cache_is_current(self))
         {
             _clear_bg_cache(self);
-            if(self->conf.wallpaper_mode != FM_WP_COLOR && self->conf.wallpaper_mode != FM_WP_TILE)
+            /* the tiled image doesn't depend on the screen size, but the
+               pixmap just freed is still the background of the window, and
+               GDK fails with BadDrawable when it draws from it */
+            if(self->conf.wallpaper_mode != FM_WP_COLOR)
                 update_background(self, -1);
         }
     }
