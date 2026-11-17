@@ -87,6 +87,10 @@ struct _FmBackgroundCache
 #endif
     FmWallpaperMode wallpaper_mode;
     time_t mtime;
+    /* the monitor, the screen size and the scale it was made for */
+    GdkRectangle geom;
+    gint screen_w, screen_h;
+    gint scale;
 };
 
 static void queue_layout_items(FmDesktop* desktop);
@@ -2168,6 +2172,29 @@ static void _clear_bg_cache(FmDesktop *self)
     }
 }
 
+/* Whether every cached wallpaper was made for the monitor, the screen size
+   and the scale as they are now. The window has to be realized. */
+static gboolean _bg_cache_is_current(FmDesktop *self)
+{
+    GdkScreen *screen = gtk_widget_get_screen(GTK_WIDGET(self));
+    FmBackgroundCache *cache;
+    GdkRectangle geom;
+    gint scale = 1;
+
+#if HIDPI_WALLPAPER
+    scale = gdk_window_get_scale_factor(gtk_widget_get_window(GTK_WIDGET(self)));
+#endif
+    gdk_screen_get_monitor_geometry(screen, self->monitor, &geom);
+    for(cache = self->cache; cache; cache = cache->next)
+        if(!cache->bg || cache->scale != scale
+           || cache->screen_w != gdk_screen_get_width(screen)
+           || cache->screen_h != gdk_screen_get_height(screen)
+           || cache->geom.x != geom.x || cache->geom.y != geom.y
+           || cache->geom.width != geom.width || cache->geom.height != geom.height)
+            return FALSE;
+    return self->cache != NULL;
+}
+
 static void update_background(FmDesktop* desktop, int is_it)
 {
     GtkWidget* widget = (GtkWidget*)desktop;
@@ -2340,6 +2367,13 @@ static void update_background(FmDesktop* desktop, int is_it)
         int src_w, src_h;
         int dest_w, dest_h;
         int x = 0, y = 0;
+        GdkRectangle geom;
+
+        gdk_screen_get_monitor_geometry(screen, desktop->monitor, &geom);
+        cache->geom = geom;
+        cache->screen_w = gdk_screen_get_width(screen);
+        cache->screen_h = gdk_screen_get_height(screen);
+        cache->scale = scale;
         src_w = gdk_pixbuf_get_width(pix);
         src_h = gdk_pixbuf_get_height(pix);
         if(desktop->conf.wallpaper_mode == FM_WP_TILE)
@@ -2349,8 +2383,6 @@ static void update_background(FmDesktop* desktop, int is_it)
         }
         else
         {
-            GdkRectangle geom;
-            gdk_screen_get_monitor_geometry(screen, desktop->monitor, &geom);
             if (desktop->conf.wallpaper_mode == FM_WP_SCREEN)
             {
                 dest_w = gdk_screen_get_width(screen) * scale;
@@ -3483,10 +3515,16 @@ static void on_size_allocate(GtkWidget* w, GtkAllocation* alloc)
         pango_font_description_free(font_desc);
 #endif
         /* bug #3614866: after monitor geometry was changed we need to redraw
-           the background invalidating all the cache */
-        _clear_bg_cache(self);
-        if(self->conf.wallpaper_mode != FM_WP_COLOR && self->conf.wallpaper_mode != FM_WP_TILE)
-            update_background(self, -1);
+           the background invalidating all the cache; but not when nothing
+           changed, as for the first allocation, right after on_realize() has
+           loaded the wallpaper: loading it again takes a few hundred ms for
+           a big one */
+        if(!_bg_cache_is_current(self))
+        {
+            _clear_bg_cache(self);
+            if(self->conf.wallpaper_mode != FM_WP_COLOR && self->conf.wallpaper_mode != FM_WP_TILE)
+                update_background(self, -1);
+        }
     }
 
     GTK_WIDGET_CLASS(fm_desktop_parent_class)->size_allocate(w, alloc);
