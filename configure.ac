@@ -23,6 +23,7 @@ AC_HEADER_STDC
 
 # Checks for library functions.
 AC_SEARCH_LIBS([floor], [m])
+AC_CHECK_FUNCS([malloc_trim])
 
 # Large file support
 AC_ARG_ENABLE([largefile],

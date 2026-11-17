@@ -35,6 +35,9 @@
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 #include <math.h>
+#ifdef HAVE_MALLOC_TRIM
+#include <malloc.h>
+#endif
 
 #include <cairo-xlib.h>
 
@@ -87,6 +90,10 @@ struct _FmBackgroundCache
 #endif
     FmWallpaperMode wallpaper_mode;
     time_t mtime;
+    /* the monitor, the screen size and the scale it was made for */
+    GdkRectangle geom;
+    gint screen_w, screen_h;
+    gint scale;
 };
 
 static void queue_layout_items(FmDesktop* desktop);
@@ -356,6 +363,16 @@ static inline void load_items(FmDesktop* desktop)
     queue_layout_items(desktop);
 }
 
+/* Makes @item the one under the pointer, and its name the tooltip. Callers do
+   it only when the item changes: each time the tooltip is set, GTK asks the X
+   server where the pointer is, four round trips. */
+static void set_hover_item(FmDesktop* desktop, FmDesktopItem* item)
+{
+    desktop->hover_item = item;
+    g_object_set(G_OBJECT(desktop), "tooltip-text",
+                 item ? fm_file_info_get_disp_name(item->fi) : NULL, NULL);
+}
+
 static inline void unload_items(FmDesktop* desktop)
 {
     /* remove existing fixed items */
@@ -363,8 +380,7 @@ static inline void unload_items(FmDesktop* desktop)
     desktop->fixed_items = NULL;
     desktop->focus = NULL;
     desktop->drop_hilight = NULL;
-    desktop->hover_item = NULL;
-    g_object_set(G_OBJECT(desktop), "tooltip-text", NULL, NULL);
+    set_hover_item(desktop, NULL);
 }
 
 static inline void reload_items(FmDesktop *desktop)
@@ -1938,11 +1954,6 @@ static void paint_item(FmDesktop* self, FmDesktopItem* item, cairo_t* cr, GdkRec
 #endif
                         item->text_rect.x, item->text_rect.y, item->text_rect.width, item->text_rect.height);
 
-    if(item == self->hover_item) /* hovered */
-        g_object_set(G_OBJECT(self), "tooltip-text", fm_file_info_get_disp_name(item->fi), NULL);
-    else
-        g_object_set(G_OBJECT(self), "tooltip-text", NULL, NULL);
-
     /* draw the icon */
 #if GTK_CHECK_VERSION(3, 10, 0)
     scale = gtk_widget_get_scale_factor(widget);
@@ -2168,6 +2179,78 @@ static void _clear_bg_cache(FmDesktop *self)
     }
 }
 
+/* Whether every cached wallpaper was made for the monitor, the screen size
+   and the scale as they are now. The window has to be realized. */
+static gboolean _bg_cache_is_current(FmDesktop *self)
+{
+    GdkScreen *screen = gtk_widget_get_screen(GTK_WIDGET(self));
+    FmBackgroundCache *cache;
+    GdkRectangle geom;
+    gint scale = 1;
+
+#if HIDPI_WALLPAPER
+    scale = gdk_window_get_scale_factor(gtk_widget_get_window(GTK_WIDGET(self)));
+#endif
+    gdk_screen_get_monitor_geometry(screen, self->monitor, &geom);
+    for(cache = self->cache; cache; cache = cache->next)
+        if(!cache->bg || cache->scale != scale
+           || cache->screen_w != gdk_screen_get_width(screen)
+           || cache->screen_h != gdk_screen_get_height(screen)
+           || cache->geom.x != geom.x || cache->geom.y != geom.y
+           || cache->geom.width != geom.width || cache->geom.height != geom.height)
+            return FALSE;
+    return self->cache != NULL;
+}
+
+#if GTK_CHECK_VERSION(3, 0, 0)
+/* Copies @image, an RGB24 image surface, to the X pixmap of @bg, a surface of
+   the same size. Drawing the wallpaper on @bg itself would let cairo send it
+   through a MIT-SHM segment, which cairo then keeps for later: as big as the
+   wallpaper (24 MB for a 3024x1964 one), shared with the X server, for as long
+   as the desktop runs. XPutImage() leaves nothing behind. */
+static void _upload_wallpaper(cairo_surface_t *bg, cairo_surface_t *image)
+{
+    Display *dpy = cairo_xlib_surface_get_display(bg);
+    Drawable drawable = cairo_xlib_surface_get_drawable(bg);
+    Visual *visual = cairo_xlib_surface_get_visual(bg);
+    int width = cairo_image_surface_get_width(image);
+    int height = cairo_image_surface_get_height(image);
+    XImage *ximage = NULL;
+
+    cairo_surface_flush(image);
+    /* an RGB24 pixel is a 32-bit 0x00RRGGBB in native byte order */
+    if(cairo_xlib_surface_get_depth(bg) == 24 && visual->red_mask == 0xff0000
+       && visual->green_mask == 0xff00 && visual->blue_mask == 0xff)
+        ximage = XCreateImage(dpy, visual, 24, ZPixmap, 0,
+                              (char*)cairo_image_surface_get_data(image), width, height,
+                              32, cairo_image_surface_get_stride(image));
+    if(ximage && ximage->bits_per_pixel == 32)
+    {
+        GC gc = XCreateGC(dpy, drawable, 0, NULL);
+
+        /* Xlib swaps the bytes if the server wants another order */
+        ximage->byte_order = (G_BYTE_ORDER == G_LITTLE_ENDIAN) ? LSBFirst : MSBFirst;
+        XPutImage(dpy, drawable, gc, ximage, 0, 0, 0, 0, width, height);
+        XFreeGC(dpy, gc);
+        cairo_surface_mark_dirty(bg);
+    }
+    else /* another visual: let cairo convert the pixels */
+    {
+        cairo_t *cr = cairo_create(bg);
+
+        cairo_set_source_surface(cr, image, 0, 0);
+        cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+        cairo_paint(cr);
+        cairo_destroy(cr);
+    }
+    if(ximage)
+    {
+        ximage->data = NULL; /* it is the image surface's */
+        XDestroyImage(ximage);
+    }
+}
+#endif
+
 static void update_background(FmDesktop* desktop, int is_it)
 {
     GtkWidget* widget = (GtkWidget*)desktop;
@@ -2340,6 +2423,16 @@ static void update_background(FmDesktop* desktop, int is_it)
         int src_w, src_h;
         int dest_w, dest_h;
         int x = 0, y = 0;
+        GdkRectangle geom;
+#if GTK_CHECK_VERSION(3, 0, 0)
+        cairo_surface_t *image;
+#endif
+
+        gdk_screen_get_monitor_geometry(screen, desktop->monitor, &geom);
+        cache->geom = geom;
+        cache->screen_w = gdk_screen_get_width(screen);
+        cache->screen_h = gdk_screen_get_height(screen);
+        cache->scale = scale;
         src_w = gdk_pixbuf_get_width(pix);
         src_h = gdk_pixbuf_get_height(pix);
         if(desktop->conf.wallpaper_mode == FM_WP_TILE)
@@ -2349,8 +2442,6 @@ static void update_background(FmDesktop* desktop, int is_it)
         }
         else
         {
-            GdkRectangle geom;
-            gdk_screen_get_monitor_geometry(screen, desktop->monitor, &geom);
             if (desktop->conf.wallpaper_mode == FM_WP_SCREEN)
             {
                 dest_w = gdk_screen_get_width(screen) * scale;
@@ -2372,7 +2463,9 @@ static void update_background(FmDesktop* desktop, int is_it)
         cache->bg = cairo_xlib_surface_create(xdisplay, xpixmap,
                                               GDK_VISUAL_XVISUAL(gdk_screen_get_system_visual(screen)),
                                               dest_w, dest_h);
-        cr = cairo_create(cache->bg);
+        /* drawn in our memory first, see _upload_wallpaper() */
+        image = cairo_image_surface_create(CAIRO_FORMAT_RGB24, dest_w, dest_h);
+        cr = cairo_create(image);
 #else
         cache->bg = gdk_pixmap_new(window, dest_w, dest_h, -1);
         cr = gdk_cairo_create(cache->bg);
@@ -2427,6 +2520,10 @@ static void update_background(FmDesktop* desktop, int is_it)
         gdk_cairo_set_source_pixbuf(cr, pix, x, y);
         cairo_paint(cr);
         cairo_destroy(cr);
+#if GTK_CHECK_VERSION(3, 0, 0)
+        _upload_wallpaper(cache->bg, image);
+        cairo_surface_destroy(image);
+#endif
 #if HIDPI_WALLPAPER
         cairo_surface_set_device_scale(cache->bg, scale, scale);
 #endif
@@ -2491,7 +2588,16 @@ static void update_background(FmDesktop* desktop, int is_it)
     XUngrabServer(xdisplay);
 
     if(pix)
+    {
         g_object_unref(pix);
+#ifdef HAVE_MALLOC_TRIM
+        /* Loading, scaling and drawing the wallpaper took several buffers as
+           big as the screen; glibc keeps such freed memory in the process (it
+           did 20 MB and more of it for a 3024x1964 one) unless told to give
+           it back. */
+        malloc_trim(0);
+#endif
+    }
 
     gdk_window_invalidate_rect(window, NULL, TRUE);
 }
@@ -2534,11 +2640,8 @@ static void on_row_deleting(FmFolderModel* model, GtkTreePath* tp,
     if((gpointer)desktop->drop_hilight == data)
         desktop->drop_hilight = NULL;
     if((gpointer)desktop->hover_item == data)
-    {
-        desktop->hover_item = NULL;
         /* bug #3615015: after deleting the item tooltip stuck on the desktop */
-        g_object_set(G_OBJECT(desktop), "tooltip-text", NULL, NULL);
-    }
+        set_hover_item(desktop, NULL);
     fm_desktop_accessible_item_deleted(desktop, data);
     desktop_item_free(data);
 }
@@ -2683,6 +2786,8 @@ static void on_row_changed(FmFolderModel* model, GtkTreePath* tp, GtkTreeIter* i
                        FM_FOLDER_MODEL_COL_INFO, &item->fi,
                        FM_FOLDER_MODEL_COL_ICON, &icon, -1);
     fm_file_info_ref(item->fi);
+    if(item == desktop->hover_item) /* it may have a new name */
+        set_hover_item(desktop, item);
 
     /* we need to redraw old area as we changing data */
     redraw_item(desktop, item);
@@ -3483,10 +3588,19 @@ static void on_size_allocate(GtkWidget* w, GtkAllocation* alloc)
         pango_font_description_free(font_desc);
 #endif
         /* bug #3614866: after monitor geometry was changed we need to redraw
-           the background invalidating all the cache */
-        _clear_bg_cache(self);
-        if(self->conf.wallpaper_mode != FM_WP_COLOR && self->conf.wallpaper_mode != FM_WP_TILE)
-            update_background(self, -1);
+           the background invalidating all the cache; but not when nothing
+           changed, as for the first allocation, right after on_realize() has
+           loaded the wallpaper: loading it again takes a few hundred ms for
+           a big one */
+        if(!_bg_cache_is_current(self))
+        {
+            _clear_bg_cache(self);
+            /* the tiled image doesn't depend on the screen size, but the
+               pixmap just freed is still the background of the window, and
+               GDK fails with BadDrawable when it draws from it */
+            if(self->conf.wallpaper_mode != FM_WP_COLOR)
+                update_background(self, -1);
+        }
     }
 
     GTK_WIDGET_CLASS(fm_desktop_parent_class)->size_allocate(w, alloc);
@@ -3708,7 +3822,7 @@ static gboolean on_button_press(GtkWidget* w, GdkEventButton* evt)
         if(tp)
             gtk_tree_path_free(tp);
         /* SF bug #929: after click the tooltip is still set to the item name */
-        self->hover_item = NULL;
+        set_hover_item(self, NULL);
     }
     /* forward the event to root window */
     else if(evt->button != 1 && evt->button == self->button_pressed)
@@ -3827,7 +3941,7 @@ static gboolean on_motion_notify(GtkWidget* w, GdkEventMotion* evt)
                     self->single_click_timeout_handler = 0;
                 }
                 window = gtk_widget_get_window(w);
-                self->hover_item = item;
+                set_hover_item(self, item);
                 if (hover_item)
                     redraw_item(self, hover_item);
                 if(item)
@@ -3858,7 +3972,7 @@ static gboolean on_motion_notify(GtkWidget* w, GdkEventMotion* evt)
 
             if(item != hover_item)
             {
-                self->hover_item = item;
+                set_hover_item(self, item);
                 if (hover_item)
                     redraw_item(self, hover_item);
                 if(item)
