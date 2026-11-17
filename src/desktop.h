@@ -79,6 +79,8 @@ struct _FmDesktop
     guint idle_layout;
     FmDndSrc* dnd_src;
     FmDndDest* dnd_dest;
+    GList* pending_drops; /* files dropped here that have not appeared yet */
+    guint pending_drops_timeout;
     guint single_click_timeout_handler;
     guint button_pressed;
     FmFolderModel* model;
