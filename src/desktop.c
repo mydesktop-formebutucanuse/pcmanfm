@@ -35,6 +35,9 @@
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 #include <math.h>
+#ifdef HAVE_MALLOC_TRIM
+#include <malloc.h>
+#endif
 
 #include <cairo-xlib.h>
 
@@ -2523,7 +2526,16 @@ static void update_background(FmDesktop* desktop, int is_it)
     XUngrabServer(xdisplay);
 
     if(pix)
+    {
         g_object_unref(pix);
+#ifdef HAVE_MALLOC_TRIM
+        /* Loading, scaling and drawing the wallpaper took several buffers as
+           big as the screen; glibc keeps such freed memory in the process (it
+           did 20 MB and more of it for a 3024x1964 one) unless told to give
+           it back. */
+        malloc_trim(0);
+#endif
+    }
 
     gdk_window_invalidate_rect(window, NULL, TRUE);
 }
